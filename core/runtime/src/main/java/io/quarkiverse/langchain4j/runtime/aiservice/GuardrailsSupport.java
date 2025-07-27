@@ -15,10 +15,12 @@ import jakarta.enterprise.inject.spi.BeanManager;
 import jakarta.enterprise.inject.spi.CDI;
 
 import dev.langchain4j.agent.tool.ToolSpecification;
+import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.memory.ChatMemory;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.model.chat.response.ChatResponse;
+import dev.langchain4j.model.chat.response.ChatResponseMetadata;
 import dev.langchain4j.rag.AugmentationResult;
 import io.quarkiverse.langchain4j.audit.AuditSourceInfo;
 import io.quarkiverse.langchain4j.audit.InputGuardrailExecutedEvent;
@@ -233,7 +235,18 @@ public class GuardrailsSupport {
         return producer.apply(failures);
     }
 
-    public static Multi<String> accumulate(Multi<String> upstream, AiServiceMethodCreateInfo methodCreateInfo) {
+    private static class ChatResponseAccumulator {
+        private final StringBuilder stringBuilder;
+        private ChatResponseMetadata metadata;
+
+        ChatResponseAccumulator() {
+            this.stringBuilder = new StringBuilder();
+            this.metadata = null;
+        }
+
+    }
+
+    public static Multi<ChatResponse> accumulate(Multi<ChatResponse> upstream, AiServiceMethodCreateInfo methodCreateInfo) {
         if (methodCreateInfo.getOutputGuardrailsClassNames().isEmpty()) {
             return upstream;
         }
@@ -243,8 +256,16 @@ public class GuardrailsSupport {
             if (accumulator == null) {
                 String cn = methodCreateInfo.getOutputTokenAccumulatorClassName();
                 if (cn == null) {
-                    return upstream.collect().in(StringBuilder::new, StringBuilder::append)
-                            .map(StringBuilder::toString)
+                    return upstream.collect().in(ChatResponseAccumulator::new, (chatResponseAccumulator, chatResponse) -> {
+                        chatResponseAccumulator.stringBuilder.append(chatResponse.aiMessage().text());
+                        if (chatResponse.metadata() != null && chatResponse.metadata().id() != null) {
+                            chatResponseAccumulator.metadata = chatResponse.metadata();
+                        }
+                    })
+                            .map(acc -> ChatResponse.builder()
+                                    .aiMessage(AiMessage.builder().text(acc.stringBuilder.toString()).build())
+                                    .metadata(acc.metadata != null ? acc.metadata : ChatResponseMetadata.builder().build())
+                                    .build())
                             .toMulti();
                 }
                 try {
@@ -261,7 +282,18 @@ public class GuardrailsSupport {
             }
         }
         var actual = accumulator;
-        return upstream.plug(s -> actual.accumulate(upstream));
+        return upstream.withContext((chatResponseMulti, context) -> {
+            return chatResponseMulti.map(it -> {
+                if (it.metadata() != null && it.metadata().id() != null) {
+                    context.put("metadata", it.metadata());
+                }
+                return it.aiMessage().text();
+            })
+                    .plug(actual::accumulate)
+                    .map(s -> ChatResponse.builder().aiMessage(AiMessage.builder().text(s).build())
+                            .metadata(context.getOrElse("metadata", () -> ChatResponseMetadata.builder().build())).build());
+
+        });
     }
 
     public static OutputGuardrailResult invokeOutputGuardrailsForStream(AiServiceMethodCreateInfo methodCreateInfo,
