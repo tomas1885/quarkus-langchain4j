@@ -256,7 +256,12 @@ public class AiServiceMethodImplementationSupport {
                                             if (!isStringMulti) {
                                                 return resp;
                                             }
-                                            return ((ChatResponse) resp).aiMessage().text();
+                                            var chatResponse = (ChatResponse) resp;
+                                            if (chatResponse.metadata() != null
+                                                    && chatResponse.metadata().finishReason() != null) {
+                                                return "";
+                                            }
+                                            return chatResponse.aiMessage().text();
                                         });
                             }
 
@@ -321,7 +326,11 @@ public class AiServiceMethodImplementationSupport {
                             if (!isStringMulti) {
                                 return resp;
                             }
-                            return ((ChatResponse) resp).aiMessage().text();
+                            var chatResponse = (ChatResponse) resp;
+                            if (chatResponse.metadata() != null && chatResponse.metadata().finishReason() != null) {
+                                return "";
+                            }
+                            return chatResponse.aiMessage().text();
                         });
             }
 
@@ -375,7 +384,11 @@ public class AiServiceMethodImplementationSupport {
                         if (!isStringMulti) {
                             return resp;
                         }
-                        return ((ChatResponse) resp).aiMessage().text();
+                        var chatResponse = (ChatResponse) resp;
+                        if (chatResponse.metadata() != null && chatResponse.metadata().finishReason() != null) {
+                            return "";
+                        }
+                        return chatResponse.aiMessage().text();
                     });
         }
 
