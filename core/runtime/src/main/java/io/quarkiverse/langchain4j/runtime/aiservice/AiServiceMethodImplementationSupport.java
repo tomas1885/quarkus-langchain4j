@@ -177,6 +177,10 @@ public class AiServiceMethodImplementationSupport {
         Map<String, Object> templateVariables = getTemplateVariables(methodArgs, methodCreateInfo.getUserMessageInfo());
 
         Type returnType = methodCreateInfo.getReturnType();
+        boolean isMulti = TypeUtil.isMulti(returnType);
+
+        final boolean isStringMulti = (isMulti && returnType instanceof ParameterizedType
+                && TypeUtil.isTypeOf(((ParameterizedType) returnType).getActualTypeArguments()[0], String.class));
         if (TypeUtil.isImage(returnType) || TypeUtil.isResultImage(returnType)) {
             return doImplementGenerateImage(methodCreateInfo, context, systemMessage, userMessage, memoryId, returnType,
                     templateVariables, auditSourceInfo);
@@ -217,7 +221,7 @@ public class AiServiceMethodImplementationSupport {
             Metadata metadata = Metadata.from(userMessage, memoryId, chatMemory);
             AugmentationRequest augmentationRequest = new AugmentationRequest(userMessage, metadata);
 
-            if (!TypeUtil.isMulti(returnType)) {
+            if (!isMulti) {
                 augmentationResult = context.retrievalAugmentor.augment(augmentationRequest);
                 userMessage = (UserMessage) augmentationResult.chatMessage();
             } else {
@@ -247,7 +251,18 @@ public class AiServiceMethodImplementationSupport {
                                 return stream.plug(m -> ResponseAugmenterSupport.apply(m, methodCreateInfo,
                                         new ResponseAugmenterParams((UserMessage) augmentedUserMessage,
                                                 memory, ar, methodCreateInfo.getUserMessageTemplate(),
-                                                templateVariables)));
+                                                templateVariables)))
+                                        .map(resp -> {
+                                            if (!isStringMulti) {
+                                                return resp;
+                                            }
+                                            var chatResponse = (ChatResponse) resp;
+                                            if (chatResponse.metadata() != null
+                                                    && chatResponse.metadata().finishReason() != null) {
+                                                return "";
+                                            }
+                                            return chatResponse.aiMessage().text();
+                                        });
                             }
 
                             private List<ChatMessage> messagesToSend(UserMessage augmentedUserMessage,
@@ -297,7 +312,7 @@ public class AiServiceMethodImplementationSupport {
 
         var actualAugmentationResult = augmentationResult;
         var actualUserMessage = userMessage;
-        if (TypeUtil.isMulti(returnType)) {
+        if (isMulti) {
             chatMemory.commit(); // for streaming cases, we really have to commit because all alternatives are worse
             if (methodCreateInfo.getOutputGuardrailsClassNames().isEmpty()) {
                 var stream = new TokenStreamMulti(messagesToSend, toolSpecifications, toolExecutors,
@@ -306,7 +321,17 @@ public class AiServiceMethodImplementationSupport {
                 return stream.plug(m -> ResponseAugmenterSupport.apply(m, methodCreateInfo,
                         new ResponseAugmenterParams(actualUserMessage,
                                 chatMemory, actualAugmentationResult, methodCreateInfo.getUserMessageTemplate(),
-                                Collections.unmodifiableMap(templateVariables))));
+                                Collections.unmodifiableMap(templateVariables))))
+                        .map(resp -> {
+                            if (!isStringMulti) {
+                                return resp;
+                            }
+                            var chatResponse = (ChatResponse) resp;
+                            if (chatResponse.metadata() != null && chatResponse.metadata().finishReason() != null) {
+                                return "";
+                            }
+                            return chatResponse.aiMessage().text();
+                        });
             }
 
             return new TokenStreamMulti(messagesToSend, toolSpecifications, toolExecutors,
@@ -317,7 +342,7 @@ public class AiServiceMethodImplementationSupport {
                         OutputGuardrailResult result;
                         try {
                             result = GuardrailsSupport.invokeOutputGuardrailsForStream(methodCreateInfo,
-                                    new OutputGuardrailParams(AiMessage.from(chunk), chatMemory, actualAugmentationResult,
+                                    new OutputGuardrailParams(chunk.aiMessage(), chatMemory, actualAugmentationResult,
                                             methodCreateInfo.getUserMessageTemplate(),
                                             Collections.unmodifiableMap(templateVariables)),
                                     beanManager, auditSourceInfo);
@@ -354,7 +379,17 @@ public class AiServiceMethodImplementationSupport {
                     .plug(m -> ResponseAugmenterSupport.apply(m, methodCreateInfo,
                             new ResponseAugmenterParams(actualUserMessage,
                                     chatMemory, actualAugmentationResult, methodCreateInfo.getUserMessageTemplate(),
-                                    Collections.unmodifiableMap(templateVariables))));
+                                    Collections.unmodifiableMap(templateVariables))))
+                    .map(resp -> {
+                        if (!isStringMulti) {
+                            return resp;
+                        }
+                        var chatResponse = (ChatResponse) resp;
+                        if (chatResponse.metadata() != null && chatResponse.metadata().finishReason() != null) {
+                            return "";
+                        }
+                        return chatResponse.aiMessage().text();
+                    });
         }
 
         Future<Moderation> moderationFuture = triggerModerationIfNeeded(context, methodCreateInfo, messagesToSend);
@@ -915,7 +950,7 @@ public class AiServiceMethodImplementationSupport {
         Object wrap(Input input, Function<Input, Object> fun);
     }
 
-    private static class TokenStreamMulti extends AbstractMulti<String> implements Multi<String> {
+    private static class TokenStreamMulti extends AbstractMulti<ChatResponse> implements Multi<ChatResponse> {
         private final List<ChatMessage> messagesToSend;
         private final List<ToolSpecification> toolSpecifications;
         private final Map<String, ToolExecutor> toolsExecutors;
@@ -941,14 +976,14 @@ public class AiServiceMethodImplementationSupport {
         }
 
         @Override
-        public void subscribe(MultiSubscriber<? super String> subscriber) {
-            UnicastProcessor<String> processor = UnicastProcessor.create();
+        public void subscribe(MultiSubscriber<? super ChatResponse> subscriber) {
+            UnicastProcessor<ChatResponse> processor = UnicastProcessor.create();
             processor.subscribe(subscriber);
 
             createTokenStream(processor);
         }
 
-        private void createTokenStream(UnicastProcessor<String> processor) {
+        private void createTokenStream(UnicastProcessor<ChatResponse> processor) {
             Context ctxt = null;
             if (switchToWorkerThreadForToolExecution || isCallerRunningOnWorkerThread) {
                 // we create or retrieve the current context, to use `executeBlocking` when required.
@@ -959,8 +994,12 @@ public class AiServiceMethodImplementationSupport {
                     toolsExecutors, contents, context, memoryId, ctxt, switchToWorkerThreadForToolExecution,
                     isCallerRunningOnWorkerThread);
             TokenStream tokenStream = stream
-                    .onPartialResponse(processor::onNext)
-                    .onCompleteResponse(message -> processor.onComplete())
+                    .onPartialResponse(chunk -> processor
+                            .onNext(ChatResponse.builder().aiMessage(AiMessage.builder().text(chunk).build()).build()))
+                    .onCompleteResponse(message -> {
+                        processor.onNext(message);
+                        processor.onComplete();
+                    })
                     .onError(processor::onError);
             // This is equivalent to "run subscription on worker thread"
             if (switchToWorkerThreadForToolExecution && Context.isOnEventLoopThread()) {
