@@ -3,11 +3,7 @@ package io.quarkiverse.langchain4j.runtime.aiservice;
 import static dev.langchain4j.data.message.UserMessage.userMessage;
 import static io.quarkiverse.langchain4j.guardrails.InputGuardrailParams.rewriteUserMessage;
 
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
+import java.util.*;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -15,7 +11,6 @@ import jakarta.enterprise.inject.spi.BeanManager;
 import jakarta.enterprise.inject.spi.CDI;
 
 import dev.langchain4j.agent.tool.ToolSpecification;
-import dev.langchain4j.data.message.AiMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.memory.ChatMemory;
 import dev.langchain4j.model.chat.ChatModel;
@@ -246,26 +241,29 @@ public class GuardrailsSupport {
 
     }
 
-    public static Multi<ChatResponse> accumulate(Multi<ChatResponse> upstream, AiServiceMethodCreateInfo methodCreateInfo) {
-        if (methodCreateInfo.getOutputGuardrailsClassNames().isEmpty()) {
-            return upstream;
-        }
+    public static Multi<ChatEvent.AccumulatedResponseEvent> accumulate(
+            Multi<ChatEvent> upstream, AiServiceMethodCreateInfo methodCreateInfo) {
         OutputTokenAccumulator accumulator;
         synchronized (AiServiceMethodImplementationSupport.class) {
             accumulator = methodCreateInfo.getOutputTokenAccumulator();
             if (accumulator == null) {
                 String cn = methodCreateInfo.getOutputTokenAccumulatorClassName();
                 if (cn == null) {
-                    return upstream.collect().in(ChatResponseAccumulator::new, (chatResponseAccumulator, chatResponse) -> {
-                        chatResponseAccumulator.stringBuilder.append(chatResponse.aiMessage().text());
-                        if (chatResponse.metadata() != null && chatResponse.metadata().id() != null) {
-                            chatResponseAccumulator.metadata = chatResponse.metadata();
+                    return upstream.collect().in(ChatResponseAccumulator::new, (chatResponseAccumulator, chatEvent) -> {
+                        if (chatEvent
+                                .getEventType() == ChatEvent.ChatEventType.PartialResponse) {
+                            chatResponseAccumulator.stringBuilder.append(
+                                    ((ChatEvent.PartialResponseEvent) chatEvent)
+                                            .getChunk());
+                        }
+                        if (chatEvent
+                                .getEventType() == ChatEvent.ChatEventType.Completed) {
+                            chatResponseAccumulator.metadata = ((ChatEvent.ChatCompletedEvent) chatEvent)
+                                    .getChatResponse().metadata();
                         }
                     })
-                            .map(acc -> ChatResponse.builder()
-                                    .aiMessage(AiMessage.builder().text(acc.stringBuilder.toString()).build())
-                                    .metadata(acc.metadata != null ? acc.metadata : ChatResponseMetadata.builder().build())
-                                    .build())
+                            .map(acc -> new ChatEvent.AccumulatedResponseEvent(
+                                    acc.stringBuilder.toString(), acc.metadata))
                             .toMulti();
                 }
                 try {
@@ -283,15 +281,20 @@ public class GuardrailsSupport {
         }
         var actual = accumulator;
         return upstream.withContext((chatResponseMulti, context) -> {
-            return chatResponseMulti.map(it -> {
-                if (it.metadata() != null && it.metadata().id() != null) {
-                    context.put("metadata", it.metadata());
-                }
-                return it.aiMessage().text();
-            })
+            return chatResponseMulti
+                    .map(it -> {
+                        if (it.getEventType() == ChatEvent.ChatEventType.Completed) {
+                            context.put("metadata", ((ChatEvent.ChatCompletedEvent) it)
+                                    .getChatResponse().metadata());
+                        }
+                        if (it.getEventType() == ChatEvent.ChatEventType.PartialResponse) {
+                            return ((ChatEvent.PartialResponseEvent) it).getChunk();
+                        }
+                        return null;
+                    }).filter(Objects::nonNull)
                     .plug(actual::accumulate)
-                    .map(s -> ChatResponse.builder().aiMessage(AiMessage.builder().text(s).build())
-                            .metadata(context.getOrElse("metadata", () -> ChatResponseMetadata.builder().build())).build());
+                    .map(s -> new ChatEvent.AccumulatedResponseEvent(s,
+                            context.getOrElse("metadata", () -> ChatResponseMetadata.builder().build())));
 
         });
     }

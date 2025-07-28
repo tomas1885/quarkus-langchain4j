@@ -622,7 +622,7 @@ public class AiServicesProcessor {
                 if (method.returnType().kind() == Type.Kind.PARAMETERIZED_TYPE) {
                     Type multiType = method.returnType().asParameterizedType().arguments().get(0);
                     if (DotNames.STRING.equals(multiType.name())
-                            || DotNames.CHAT_RESPONSE.equals(multiType.name())) {
+                            || DotNames.CHAT_EVENT.equals(multiType.name())) {
                         isSupportedResponseType = true;
                     }
                 }

@@ -78,12 +78,7 @@ import dev.langchain4j.service.tool.ToolExecutor;
 import dev.langchain4j.service.tool.ToolProviderRequest;
 import dev.langchain4j.service.tool.ToolProviderResult;
 import dev.langchain4j.spi.ServiceHelper;
-import io.quarkiverse.langchain4j.audit.AuditSourceInfo;
-import io.quarkiverse.langchain4j.audit.InitialMessagesCreatedEvent;
-import io.quarkiverse.langchain4j.audit.LLMInteractionCompleteEvent;
-import io.quarkiverse.langchain4j.audit.LLMInteractionFailureEvent;
-import io.quarkiverse.langchain4j.audit.ResponseFromLLMReceivedEvent;
-import io.quarkiverse.langchain4j.audit.ToolExecutedEvent;
+import io.quarkiverse.langchain4j.audit.*;
 import io.quarkiverse.langchain4j.audit.internal.DefaultInitialMessagesCreatedEvent;
 import io.quarkiverse.langchain4j.audit.internal.DefaultLLMInteractionCompleteEvent;
 import io.quarkiverse.langchain4j.audit.internal.DefaultLLMInteractionFailureEvent;
@@ -252,16 +247,13 @@ public class AiServiceMethodImplementationSupport {
                                         new ResponseAugmenterParams((UserMessage) augmentedUserMessage,
                                                 memory, ar, methodCreateInfo.getUserMessageTemplate(),
                                                 templateVariables)))
-                                        .map(resp -> {
-                                            if (!isStringMulti) {
-                                                return resp;
+                                        .filter(event -> {
+                                            return !isStringMulti || event instanceof ChatEvent.PartialResponseEvent;
+                                        }).map(event -> {
+                                            if (isStringMulti && event instanceof ChatEvent.PartialResponseEvent) {
+                                                return ((ChatEvent.PartialResponseEvent) event).getChunk();
                                             }
-                                            var chatResponse = (ChatResponse) resp;
-                                            if (chatResponse.metadata() != null
-                                                    && chatResponse.metadata().finishReason() != null) {
-                                                return "";
-                                            }
-                                            return chatResponse.aiMessage().text();
+                                            return event;
                                         });
                             }
 
@@ -322,15 +314,13 @@ public class AiServiceMethodImplementationSupport {
                         new ResponseAugmenterParams(actualUserMessage,
                                 chatMemory, actualAugmentationResult, methodCreateInfo.getUserMessageTemplate(),
                                 Collections.unmodifiableMap(templateVariables))))
-                        .map(resp -> {
-                            if (!isStringMulti) {
-                                return resp;
+                        .filter(event -> {
+                            return !isStringMulti || event instanceof ChatEvent.PartialResponseEvent;
+                        }).map(event -> {
+                            if (isStringMulti && event instanceof ChatEvent.PartialResponseEvent) {
+                                return ((ChatEvent.PartialResponseEvent) event).getChunk();
                             }
-                            var chatResponse = (ChatResponse) resp;
-                            if (chatResponse.metadata() != null && chatResponse.metadata().finishReason() != null) {
-                                return "";
-                            }
-                            return chatResponse.aiMessage().text();
+                            return event;
                         });
             }
 
@@ -342,7 +332,8 @@ public class AiServiceMethodImplementationSupport {
                         OutputGuardrailResult result;
                         try {
                             result = GuardrailsSupport.invokeOutputGuardrailsForStream(methodCreateInfo,
-                                    new OutputGuardrailParams(chunk.aiMessage(), chatMemory, actualAugmentationResult,
+                                    new OutputGuardrailParams(AiMessage.from(chunk.getMessage()), chatMemory,
+                                            actualAugmentationResult,
                                             methodCreateInfo.getUserMessageTemplate(),
                                             Collections.unmodifiableMap(templateVariables)),
                                     beanManager, auditSourceInfo);
@@ -379,17 +370,7 @@ public class AiServiceMethodImplementationSupport {
                     .plug(m -> ResponseAugmenterSupport.apply(m, methodCreateInfo,
                             new ResponseAugmenterParams(actualUserMessage,
                                     chatMemory, actualAugmentationResult, methodCreateInfo.getUserMessageTemplate(),
-                                    Collections.unmodifiableMap(templateVariables))))
-                    .map(resp -> {
-                        if (!isStringMulti) {
-                            return resp;
-                        }
-                        var chatResponse = (ChatResponse) resp;
-                        if (chatResponse.metadata() != null && chatResponse.metadata().finishReason() != null) {
-                            return "";
-                        }
-                        return chatResponse.aiMessage().text();
-                    });
+                                    Collections.unmodifiableMap(templateVariables))));
         }
 
         Future<Moderation> moderationFuture = triggerModerationIfNeeded(context, methodCreateInfo, messagesToSend);
@@ -950,7 +931,7 @@ public class AiServiceMethodImplementationSupport {
         Object wrap(Input input, Function<Input, Object> fun);
     }
 
-    private static class TokenStreamMulti extends AbstractMulti<ChatResponse> implements Multi<ChatResponse> {
+    private static class TokenStreamMulti extends AbstractMulti<ChatEvent> implements Multi<ChatEvent> {
         private final List<ChatMessage> messagesToSend;
         private final List<ToolSpecification> toolSpecifications;
         private final Map<String, ToolExecutor> toolsExecutors;
@@ -976,14 +957,14 @@ public class AiServiceMethodImplementationSupport {
         }
 
         @Override
-        public void subscribe(MultiSubscriber<? super ChatResponse> subscriber) {
-            UnicastProcessor<ChatResponse> processor = UnicastProcessor.create();
+        public void subscribe(MultiSubscriber<? super ChatEvent> subscriber) {
+            UnicastProcessor<ChatEvent> processor = UnicastProcessor.create();
             processor.subscribe(subscriber);
 
             createTokenStream(processor);
         }
 
-        private void createTokenStream(UnicastProcessor<ChatResponse> processor) {
+        private void createTokenStream(UnicastProcessor<ChatEvent> processor) {
             Context ctxt = null;
             if (switchToWorkerThreadForToolExecution || isCallerRunningOnWorkerThread) {
                 // we create or retrieve the current context, to use `executeBlocking` when required.
@@ -995,10 +976,16 @@ public class AiServiceMethodImplementationSupport {
                     isCallerRunningOnWorkerThread);
             TokenStream tokenStream = stream
                     .onPartialResponse(chunk -> processor
-                            .onNext(ChatResponse.builder().aiMessage(AiMessage.builder().text(chunk).build()).build()))
+                            .onNext(new ChatEvent.PartialResponseEvent(chunk)))
                     .onCompleteResponse(message -> {
-                        processor.onNext(message);
+                        processor.onNext(new ChatEvent.ChatCompletedEvent(message));
                         processor.onComplete();
+                    })
+                    .onRetrieved(content -> {
+                        processor.onNext(new ChatEvent.ContentFetchedEvent(content));
+                    })
+                    .onToolExecuted(execution -> {
+                        processor.onNext(new ChatEvent.ToolExecutedEvent(execution));
                     })
                     .onError(processor::onError);
             // This is equivalent to "run subscription on worker thread"
